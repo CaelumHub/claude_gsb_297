@@ -13,7 +13,7 @@ import time
 from engine import new_id
 
 
-def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
+def seed_demo_data(registry, env_mgr, notify_mgr, testdata_mgr=None) -> dict:
     """生成演示项目，返回 ``{"project": ..., "env_id": ..., "suite_id": ...}``。"""
     proj = {
         "id": new_id("proj"),
@@ -131,13 +131,88 @@ def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
         "type": "webhook",
         "name": "CI Webhook",
         "config": {"url": "https://example.com/hooks/ci"},
-        "events": ["build.finished", "build.failed"],
+        "events": ["build.finished", "build.failed",
+                   "testdata.overdue", "testdata.reclaimed"],
     })
     notify_mgr.create(pid, {
         "type": "email",
         "name": "团队邮件",
         "config": {"address": "qa@example.com"},
-        "events": ["build.failed"],
+        "events": ["build.failed", "testdata.overdue"],
     })
 
+    if testdata_mgr is not None:
+        _seed_testdata(registry, testdata_mgr, pid)
+
     return {"project": proj, "env_id": env["id"], "suite_id": suite["id"]}
+
+
+def _seed_testdata(registry, mgr, pid: str) -> None:
+    """演示测试数据：账号池（dev/staging 隔离）+ 订单号池，含借出中与过期数据。"""
+    acc_pool = mgr.create_pool(pid, {
+        "name": "测试账号池",
+        "category": "账号",
+        "description": "登录/鉴权用例共用的测试账号，按环境隔离，借期 2 小时。",
+        "envs": ["dev", "staging"],
+        "default_lease_minutes": 120,
+        "overdue_action": "notify",
+    })
+    order_pool = mgr.create_pool(pid, {
+        "name": "订单号池",
+        "category": "订单",
+        "description": "一次性订单号，借期 30 分钟，过期自动回收复用。",
+        "envs": ["dev", "staging"],
+        "default_lease_minutes": 30,
+        "overdue_action": "reclaim",
+    })
+
+    mgr.import_items(acc_pool["id"], [
+        {"key": "qa_admin", "value": {"username": "qa_admin", "password": "Aa123456",
+                                      "role": "admin"}, "tags": ["登录", "管理员"]},
+        {"key": "qa_user01", "value": {"username": "qa_user01", "password": "Aa123456",
+                                       "role": "user"}, "tags": ["登录"]},
+        {"key": "qa_user02", "value": {"username": "qa_user02", "password": "Aa123456",
+                                       "role": "user"}, "tags": ["登录", "支付"]},
+        {"key": "qa_vip", "value": {"username": "qa_vip", "password": "Aa123456",
+                                    "role": "vip"}, "tags": ["会员", "支付"]},
+    ], env="dev")
+    mgr.import_items(acc_pool["id"], [
+        {"key": "stg_admin", "value": {"username": "stg_admin", "password": "Ss123456",
+                                       "role": "admin"}, "tags": ["登录", "管理员"]},
+        {"key": "stg_user01", "value": {"username": "stg_user01", "password": "Ss123456",
+                                        "role": "user"}, "tags": ["登录"]},
+    ], env="staging")
+    mgr.import_items(order_pool["id"], [
+        {"key": f"ORD-DEV-{10001 + i}", "value": {"order_no": f"ORDDEV{10001 + i}"},
+         "tags": ["一次性"]}
+        for i in range(6)
+    ], env="dev")
+    mgr.import_items(order_pool["id"], [
+        {"key": f"ORD-STG-{20001 + i}", "value": {"order_no": f"ORDSTG{20001 + i}"},
+         "tags": ["一次性"]}
+        for i in range(3)
+    ], env="staging")
+
+    # 制造演示现场，三种状态各一：
+    # 1) zhangsan 借出中未过期；2) lisi 过期未还（notify 池 → 保持锁定、提醒）；
+    # 3) wangwu 过期（reclaim 池 → 启动扫描时自动回收，产生回收通知事件）。
+    import time as _time
+    loans_store = registry.store("data_loans")
+    now_ts = _time.time()
+    loan = mgr.borrow(pid, acc_pool["id"], "zhangsan", env="dev",
+                      tags=["登录"], purpose="登录接口联调")
+    if "id" in loan:
+        loans_store.update(loan["id"],
+                           {"borrowed_at": now_ts - 20 * 60})
+    overdue_loan = mgr.borrow(pid, acc_pool["id"], "lisi", env="dev",
+                              tags=["登录"], purpose="支付链路回归")
+    if "id" in overdue_loan:
+        past = now_ts - 3 * 3600  # 3 小时前借出，借期 2 小时 → 已过期
+        loans_store.update(overdue_loan["id"],
+                           {"borrowed_at": past, "due_at": past + 120 * 60})
+    reclaim_loan = mgr.borrow(pid, order_pool["id"], "wangwu", env="dev",
+                              purpose="下单链路回归")
+    if "id" in reclaim_loan:
+        past = now_ts - 45 * 60  # 45 分钟前借出，借期 30 分钟 → 已过期
+        loans_store.update(reclaim_loan["id"],
+                           {"borrowed_at": past, "due_at": past + 30 * 60})

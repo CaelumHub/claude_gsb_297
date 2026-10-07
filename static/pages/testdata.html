@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>测试数据管理 - 自动化测试与持续集成平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .pool-item { border: 1px solid var(--border); border-radius: 9px; padding: 12px 14px; margin-bottom: 10px; cursor: pointer; }
+    .pool-item:hover { border-color: var(--primary); }
+    .pool-item.active { border-color: var(--primary); background: var(--primary-soft); }
+    .badge.available { background: #e7f6ec; color: var(--green); }
+    .badge.in_use { background: var(--primary-soft); color: var(--primary); }
+    .badge.disabled { background: #f1f5f9; color: #94a3b8; }
+    .badge.overdue { background: #fdecec; color: var(--red); }
+    .badge.returned { background: #e7f6ec; color: var(--green); }
+    .badge.force_reclaimed { background: #fef3e2; color: var(--amber); }
+    .badge.active { background: var(--primary-soft); color: var(--primary); }
+    tr.row-overdue td { background: #fff7f7; }
+    .kv { font-family: var(--mono); font-size: 12px; color: var(--text-muted); word-break: break-all; }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">测试数据管理</h1>
+    <p class="page-desc">数据按类别入池、按环境隔离；按条件申请借用、用后归还，借出锁定、过期提醒或自动回收，全程可追踪。</p>
+
+    <div class="card">
+      <div class="row">
+        <label style="margin:0;align-self:center">项目</label>
+        <select id="project-select" style="max-width:220px" onchange="switchProject(this.value)"></select>
+        <select id="env-filter" style="max-width:130px" onchange="loadItems()">
+          <option value="">全部环境</option>
+        </select>
+        <select id="status-filter" style="max-width:130px" onchange="loadItems()">
+          <option value="">全部状态</option>
+          <option value="available">可用</option>
+          <option value="in_use">借出中</option>
+          <option value="disabled">已停用</option>
+        </select>
+        <input type="text" id="tag-filter" placeholder="标签筛选" style="max-width:120px" oninput="debouncedItems()">
+        <input type="text" id="q-filter" placeholder="搜索 key / 内容" style="max-width:160px" oninput="debouncedItems()">
+        <span style="flex:1"></span>
+        <button class="btn secondary" id="btn-scan">扫描过期</button>
+        <button class="btn" id="btn-new-pool">新建数据池</button>
+      </div>
+    </div>
+
+    <div class="card" id="stats"><div class="empty">加载中…</div></div>
+
+    <div class="grid cols-2">
+      <section class="card">
+        <h2>数据池</h2>
+        <div id="pool-list"><div class="empty">加载中…</div></div>
+      </section>
+
+      <section class="card">
+        <h2 id="items-title">数据明细</h2>
+        <div style="overflow-x:auto">
+        <table>
+          <thead><tr>
+            <th>标识 / 内容</th><th>环境</th><th>标签</th><th>状态</th><th>借用情况</th><th>操作</th>
+          </tr></thead>
+          <tbody id="item-rows"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
+        </table>
+        </div>
+      </section>
+    </div>
+
+    <div class="grid cols-2">
+      <section class="card">
+        <h2>申请借用</h2>
+        <div class="grid cols-2">
+          <div><label>借用人 *</label><input type="text" id="b-borrower" placeholder="你的名字 / 工号"></div>
+          <div><label>环境</label><select id="b-env"></select></div>
+        </div>
+        <div class="grid cols-2 mt">
+          <div><label>标签条件（逗号分隔，需全部满足）</label><input type="text" id="b-tags" placeholder="如：登录,支付"></div>
+          <div><label>借期（分钟，留空用池默认）</label><input type="number" id="b-lease" min="1" placeholder="120"></div>
+        </div>
+        <div class="mt"><label>用途</label><input type="text" id="b-purpose" placeholder="如：登录接口联调"></div>
+        <div class="row mt">
+          <button class="btn" id="btn-borrow">自动分配并借用</button>
+          <span class="muted" style="font-size:13px">从当前选中数据池里按条件分配一条空闲数据</span>
+        </div>
+        <div id="borrow-result" class="mt"></div>
+      </section>
+
+      <section class="card">
+        <h2>批量导入</h2>
+        <div class="grid cols-2">
+          <div><label>导入到环境</label><select id="i-env"></select></div>
+          <div><label>统一标签（逗号分隔）</label><input type="text" id="i-tags" placeholder="如：登录"></div>
+        </div>
+        <div class="mt">
+          <label>每行一条：<span class="mono">key=value</span> 或仅 key；# 开头为注释</label>
+          <textarea id="i-lines" class="mono" placeholder="qa_user03=Aa123456&#10;ORD-DEV-10007"></textarea>
+        </div>
+        <div class="row mt">
+          <button class="btn" id="btn-import">导入到当前池</button>
+          <span class="muted" style="font-size:13px">同环境同 key 自动去重跳过</span>
+        </div>
+        <div id="import-result" class="mt"></div>
+      </section>
+    </div>
+
+    <section class="card">
+      <h2>借出中（实时）</h2>
+      <div style="overflow-x:auto">
+      <table>
+        <thead><tr>
+          <th>数据</th><th>数据池</th><th>环境</th><th>借用人</th><th>用途</th>
+          <th>借出时间</th><th>已借时长</th><th>到期时间</th><th>操作</th>
+        </tr></thead>
+        <tbody id="loan-rows"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
+      </table>
+      </div>
+    </section>
+
+    <section class="card" id="history-card" style="display:none">
+      <h2 id="history-title">借用历史</h2>
+      <div style="overflow-x:auto">
+      <table>
+        <thead><tr>
+          <th>借用人</th><th>用途</th><th>借出时间</th><th>归还时间</th><th>借用时长</th><th>结束方式</th>
+        </tr></thead>
+        <tbody id="history-rows"></tbody>
+      </table>
+      </div>
+    </section>
+
+    <section class="card" id="pool-edit-card" style="display:none">
+      <h2 id="pool-edit-title">新建数据池</h2>
+      <div class="grid cols-2">
+        <div><label>名称 *</label><input type="text" id="p-name" placeholder="如：测试账号池"></div>
+        <div><label>类别</label><input type="text" id="p-category" placeholder="账号 / 订单 / 手机号…"></div>
+      </div>
+      <div class="grid cols-2 mt">
+        <div><label>环境列表（逗号分隔，多环境隔离）</label><input type="text" id="p-envs" placeholder="dev,staging"></div>
+        <div><label>默认借期（分钟）</label><input type="number" id="p-lease" min="1" value="120"></div>
+      </div>
+      <div class="grid cols-2 mt">
+        <div><label>过期策略</label><select id="p-overdue">
+          <option value="notify">仅提醒</option>
+          <option value="reclaim">提醒并强制回收</option>
+        </select></div>
+        <div><label>描述</label><input type="text" id="p-desc"></div>
+      </div>
+      <div class="row mt">
+        <button class="btn" id="btn-save-pool">保存</button>
+        <button class="btn secondary" id="btn-cancel-pool">取消</button>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("testdata");
+
+let projectId = null;
+let pools = [];
+let currentPoolId = null;
+let editingPoolId = null;
+let debounceTimer = null;
+
+const ITEM_STATUS = { available: "可用", in_use: "借出中", disabled: "已停用" };
+const LOAN_STATUS = { active: "借出中", returned: "已归还", force_reclaimed: "被强制回收" };
+
+async function init() {
+  const params = new URLSearchParams(location.search);
+  projectId = await fillProjectSelect($("#project-select"), params.get("project_id"));
+  if (projectId) await refresh();
+}
+
+async function switchProject(id) {
+  projectId = id; currentPoolId = null; editingPoolId = null;
+  $("#pool-edit-card").style.display = "none";
+  await refresh();
+}
+
+async function refresh() {
+  await Promise.all([loadStats(), loadPools(), loadLoans()]);
+  await loadItems();
+}
+
+/* ---------- 统计 ---------- */
+async function loadStats() {
+  const d = await api(`/api/projects/${projectId}/testdata/stats`);
+  const bs = d.by_status || {};
+  $("#stats").innerHTML = `
+    <div class="grid cols-4">
+      <div class="stat primary"><div class="v">${d.total}</div><div class="k">数据总数（${d.pools} 个池）</div></div>
+      <div class="stat good"><div class="v">${bs.available || 0}</div><div class="k">可借用</div></div>
+      <div class="stat primary"><div class="v">${bs.in_use || 0}</div><div class="k">借出中</div></div>
+      <div class="stat bad"><div class="v">${d.overdue}</div><div class="k">过期未还</div></div>
+    </div>`;
+  // 环境筛选下拉
+  const envs = Object.keys(d.by_env || {});
+  const cur = $("#env-filter").value;
+  $("#env-filter").innerHTML = '<option value="">全部环境</option>' +
+    envs.map(e => `<option ${e === cur ? "selected" : ""}>${esc(e)}</option>`).join("");
+}
+
+/* ---------- 数据池 ---------- */
+async function loadPools() {
+  const d = await api(`/api/projects/${projectId}/testdata/pools`);
+  pools = d.pools || [];
+  if (!currentPoolId && pools.length) currentPoolId = pools[0].id;
+  const host = $("#pool-list");
+  if (!pools.length) { host.innerHTML = '<div class="empty">还没有数据池，点右上角「新建数据池」</div>'; return; }
+  host.innerHTML = pools.map(p => {
+    const c = p.counts || {};
+    return `
+    <div class="pool-item ${p.id === currentPoolId ? "active" : ""}" onclick="selectPool('${p.id}')">
+      <div class="row spread">
+        <div class="row"><strong>${esc(p.name)}</strong><span class="tag">${esc(p.category || "通用")}</span></div>
+        <span class="badge ${c.overdue ? "overdue" : "available"}">${c.overdue ? c.overdue + " 条过期" : "无过期"}</span>
+      </div>
+      <div class="muted mt" style="font-size:13px">${esc(p.description || "")}</div>
+      <div class="mt" style="font-size:12px;color:var(--text-muted)">
+        环境: ${(p.envs || []).map(e => `<span class="tag">${esc(e)}</span>`).join("")}
+        · 借期 ${p.default_lease_minutes} 分钟 · 过期${p.overdue_action === "reclaim" ? "强制回收" : "仅提醒"}
+      </div>
+      <div class="mt" style="font-size:12px">
+        共 ${c.total || 0} 条 · <span style="color:var(--green)">可用 ${c.available || 0}</span>
+        · <span style="color:var(--primary)">借出 ${c.in_use || 0}</span>
+        · <span style="color:#94a3b8">停用 ${c.disabled || 0}</span>
+      </div>
+      <div class="row mt" style="gap:6px">
+        <button class="btn small secondary" onclick="event.stopPropagation();editPool('${p.id}')">编辑</button>
+        <button class="btn small danger" onclick="event.stopPropagation();delPool('${p.id}')">删除</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function selectPool(id) {
+  currentPoolId = id;
+  loadPools(); loadItems(); syncEnvSelects();
+}
+
+function currentPool() { return pools.find(p => p.id === currentPoolId); }
+
+function syncEnvSelects() {
+  const pool = currentPool();
+  const envs = (pool && pool.envs) || [];
+  $("#b-env").innerHTML = envs.map(e => `<option>${esc(e)}</option>`).join("");
+  $("#i-env").innerHTML = envs.map(e => `<option>${esc(e)}</option>`).join("");
+}
+
+/* ---------- 数据项 ---------- */
+function debouncedItems() {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(loadItems, 300);
+}
+
+async function loadItems() {
+  if (!currentPoolId) { $("#item-rows").innerHTML = '<tr><td colspan="6" class="empty">请先选择数据池</td></tr>'; return; }
+  syncEnvSelects();
+  const pool = currentPool();
+  $("#items-title").textContent = `数据明细 · ${pool ? pool.name : ""}`;
+  const params = new URLSearchParams({ pool_id: currentPoolId });
+  if ($("#env-filter").value) params.set("env", $("#env-filter").value);
+  if ($("#status-filter").value) params.set("status", $("#status-filter").value);
+  if ($("#tag-filter").value.trim()) params.set("tag", $("#tag-filter").value.trim());
+  if ($("#q-filter").value.trim()) params.set("q", $("#q-filter").value.trim());
+  const d = await api(`/api/projects/${projectId}/testdata/items?${params}`);
+  const items = d.items || [];
+  if (!items.length) { $("#item-rows").innerHTML = '<tr><td colspan="6" class="empty">没有符合条件的数据</td></tr>'; return; }
+  $("#item-rows").innerHTML = items.map(it => {
+    const val = typeof it.value === "object" ? JSON.stringify(it.value) : String(it.value ?? "");
+    const borrow = it.status === "in_use"
+      ? `<span style="color:${it.overdue ? "var(--red)" : "var(--primary)"}">${esc(it.borrowed_by || "")}</span>
+         · 已借 ${fmtBorrowed(it.borrowed_seconds)}${it.overdue ? ' <span class="badge overdue">已过期</span>' : ""}`
+      : `<span class="muted">借用 ${it.borrow_count || 0} 次</span>`;
+    const actions = it.status === "in_use"
+      ? `<button class="btn small secondary" onclick="returnItem('${it.id}')">归还</button>
+         <button class="btn small danger" onclick="reclaimItem('${it.id}')">回收</button>`
+      : `<button class="btn small" onclick="borrowOne('${it.id}')" ${it.status !== "available" ? "disabled" : ""}>借用</button>
+         <button class="btn small secondary" onclick="toggleDisable('${it.id}','${it.status}')">${it.status === "disabled" ? "启用" : "停用"}</button>`;
+    return `<tr class="${it.overdue ? "row-overdue" : ""}">
+      <td><strong>${esc(it.key)}</strong><div class="kv">${esc(val.length > 60 ? val.slice(0, 60) + "…" : val)}</div></td>
+      <td><span class="tag">${esc(it.env)}</span></td>
+      <td>${tagsHtml(it.tags)}</td>
+      <td><span class="badge ${it.status}">${ITEM_STATUS[it.status] || it.status}</span></td>
+      <td style="font-size:12px">${borrow}</td>
+      <td><div class="row" style="gap:4px">${actions}
+        <button class="btn small secondary" onclick="showHistory('${it.id}','${esc(it.key)}')">历史</button>
+        <button class="btn small danger" onclick="delItem('${it.id}')">删</button></div></td>
+    </tr>`;
+  }).join("");
+}
+
+/* ---------- 借用 / 归还 / 回收 ---------- */
+async function borrowOne(itemId) {
+  const borrower = $("#b-borrower").value.trim();
+  if (!borrower) { toast("请先在「申请借用」卡片填写借用人", "error"); return; }
+  try {
+    const loan = await api("/api/testdata/borrow", { method: "POST", body: {
+      project_id: projectId, pool_id: currentPoolId, borrower,
+      item_id: itemId,  // 指定数据时环境按数据归属自动匹配
+      purpose: $("#b-purpose").value,
+    }});
+    toast(`已借到 ${loan.item_key}`);
+    showBorrowResult(loan);
+    refresh();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+$("#btn-borrow").onclick = async () => {
+  const borrower = $("#b-borrower").value.trim();
+  if (!borrower) return toast("请填写借用人", "error");
+  if (!currentPoolId) return toast("请先选择数据池", "error");
+  const tags = $("#b-tags").value.split(",").map(s => s.trim()).filter(Boolean);
+  const body = {
+    project_id: projectId, pool_id: currentPoolId, borrower,
+    env: $("#b-env").value || undefined, tags,
+    purpose: $("#b-purpose").value,
+  };
+  if ($("#b-lease").value) body.lease_minutes = parseInt($("#b-lease").value, 10);
+  try {
+    const loan = await api("/api/testdata/borrow", { method: "POST", body });
+    toast(`已借到 ${loan.item_key}`);
+    showBorrowResult(loan);
+    refresh();
+  } catch (e) {
+    $("#borrow-result").innerHTML = `<div class="badge overdue">${esc(e.message)}</div>`;
+  }
+};
+
+function showBorrowResult(loan) {
+  const val = loan.item && typeof loan.item.value === "object"
+    ? JSON.stringify(loan.item.value) : String((loan.item || {}).value ?? "");
+  $("#borrow-result").innerHTML = `
+    <div class="stat good"><div class="v" style="font-size:18px">${esc(loan.item_key)}</div>
+    <div class="k">环境 ${esc(loan.env)} · 借期 ${loan.lease_minutes} 分钟 · 到期 ${fmtTime(loan.due_at)}</div>
+    <div class="kv mt">${esc(val)}</div></div>`;
+}
+
+async function returnItem(itemId) {
+  try {
+    await api("/api/testdata/return", { method: "POST", body: { item_id: itemId } });
+    toast("已归还"); refresh();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function returnLoan(loanId) {
+  try {
+    await api("/api/testdata/return", { method: "POST", body: { loan_id: loanId } });
+    toast("已归还"); refresh();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function reclaimItem(itemId) {
+  if (!confirm("确认强制回收该数据？借用人的使用会被立即中断。")) return;
+  try {
+    await api("/api/testdata/reclaim", { method: "POST", body: { item_id: itemId, operator: "admin" } });
+    toast("已强制回收"); refresh();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function reclaimLoan(loanId) {
+  if (!confirm("确认强制回收该数据？借用人的使用会被立即中断。")) return;
+  try {
+    await api("/api/testdata/reclaim", { method: "POST", body: { loan_id: loanId, operator: "admin" } });
+    toast("已强制回收"); refresh();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function toggleDisable(itemId, status) {
+  try {
+    await api(`/api/testdata/items/${itemId}`, { method: "PUT",
+      body: { status: status === "disabled" ? "available" : "disabled" } });
+    refresh();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function delItem(itemId) {
+  if (!confirm("确认删除该数据？")) return;
+  try {
+    await api(`/api/testdata/items/${itemId}`, { method: "DELETE" });
+    toast("已删除"); refresh();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+/* ---------- 借出中列表 ---------- */
+async function loadLoans() {
+  const d = await api(`/api/projects/${projectId}/testdata/loans?status=active`);
+  const loans = d.loans || [];
+  if (!loans.length) { $("#loan-rows").innerHTML = '<tr><td colspan="9" class="empty">当前没有借出中的数据</td></tr>'; return; }
+  $("#loan-rows").innerHTML = loans.map(l => `
+    <tr class="${l.overdue ? "row-overdue" : ""}">
+      <td><strong>${esc(l.item_key)}</strong></td>
+      <td>${esc(l.pool_name || "")}</td>
+      <td><span class="tag">${esc(l.env)}</span></td>
+      <td>${esc(l.borrower)}</td>
+      <td class="muted" style="font-size:12px">${esc(l.purpose || "—")}</td>
+      <td style="font-size:12px">${fmtTime(l.borrowed_at)}</td>
+      <td>${fmtBorrowed(l.borrowed_seconds)}${l.overdue ? ' <span class="badge overdue">已过期</span>' : ""}</td>
+      <td style="font-size:12px">${fmtTime(l.due_at)}</td>
+      <td><div class="row" style="gap:4px">
+        <button class="btn small secondary" onclick="returnLoan('${l.id}')">归还</button>
+        <button class="btn small danger" onclick="reclaimLoan('${l.id}')">回收</button>
+      </div></td>
+    </tr>`).join("");
+}
+
+/* ---------- 历史 ---------- */
+async function showHistory(itemId, key) {
+  const d = await api(`/api/testdata/items/${itemId}/history`);
+  const rows = d.history || [];
+  $("#history-card").style.display = "";
+  $("#history-title").textContent = `借用历史 · ${key}`;
+  $("#history-rows").innerHTML = rows.length ? rows.map(h => `
+    <tr>
+      <td>${esc(h.borrower)}</td>
+      <td class="muted" style="font-size:12px">${esc(h.purpose || "—")}</td>
+      <td style="font-size:12px">${fmtTime(h.borrowed_at)}</td>
+      <td style="font-size:12px">${h.returned_at ? fmtTime(h.returned_at) : "—"}</td>
+      <td>${fmtBorrowed(h.duration != null ? h.duration : h.borrowed_seconds)}</td>
+      <td><span class="badge ${h.status}">${LOAN_STATUS[h.status] || h.status}</span></td>
+    </tr>`).join("") : '<tr><td colspan="6" class="empty">还没有借用记录</td></tr>';
+  $("#history-card").scrollIntoView({ behavior: "smooth" });
+}
+
+/* ---------- 批量导入 ---------- */
+$("#btn-import").onclick = async () => {
+  if (!currentPoolId) return toast("请先选择数据池", "error");
+  const lines = $("#i-lines").value.trim();
+  if (!lines) return toast("请粘贴要导入的数据行", "error");
+  const tags = $("#i-tags").value.split(",").map(s => s.trim()).filter(Boolean);
+  try {
+    const r = await api(`/api/testdata/pools/${currentPoolId}/import`, { method: "POST",
+      body: { lines, env: $("#i-env").value || undefined, tags } });
+    $("#import-result").innerHTML =
+      `<span class="badge available">导入 ${r.imported} 条</span> ` +
+      (r.skipped ? `<span class="badge in_use">重复跳过 ${r.skipped} 条</span> ` : "") +
+      (r.failed ? `<span class="badge overdue">失败 ${r.failed} 条</span>` : "");
+    $("#i-lines").value = "";
+    refresh();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+/* ---------- 数据池编辑 ---------- */
+$("#btn-new-pool").onclick = () => {
+  editingPoolId = null;
+  $("#pool-edit-title").textContent = "新建数据池";
+  $("#p-name").value = ""; $("#p-category").value = ""; $("#p-envs").value = "dev,staging";
+  $("#p-lease").value = 120; $("#p-overdue").value = "notify"; $("#p-desc").value = "";
+  $("#pool-edit-card").style.display = "";
+  $("#pool-edit-card").scrollIntoView({ behavior: "smooth" });
+};
+
+function editPool(id) {
+  const p = pools.find(x => x.id === id);
+  if (!p) return;
+  editingPoolId = id;
+  $("#pool-edit-title").textContent = `编辑数据池 · ${p.name}`;
+  $("#p-name").value = p.name || ""; $("#p-category").value = p.category || "";
+  $("#p-envs").value = (p.envs || []).join(","); $("#p-lease").value = p.default_lease_minutes || 120;
+  $("#p-overdue").value = p.overdue_action || "notify"; $("#p-desc").value = p.description || "";
+  $("#pool-edit-card").style.display = "";
+  $("#pool-edit-card").scrollIntoView({ behavior: "smooth" });
+}
+
+$("#btn-cancel-pool").onclick = () => { $("#pool-edit-card").style.display = "none"; editingPoolId = null; };
+
+$("#btn-save-pool").onclick = async () => {
+  const name = $("#p-name").value.trim();
+  if (!name) return toast("请输入数据池名称", "error");
+  const body = {
+    name, category: $("#p-category").value.trim() || "通用",
+    envs: $("#p-envs").value.split(",").map(s => s.trim()).filter(Boolean),
+    default_lease_minutes: parseInt($("#p-lease").value, 10) || 120,
+    overdue_action: $("#p-overdue").value, description: $("#p-desc").value,
+  };
+  try {
+    if (editingPoolId) {
+      await api(`/api/testdata/pools/${editingPoolId}`, { method: "PUT", body });
+      toast("已保存");
+    } else {
+      const pool = await api(`/api/projects/${projectId}/testdata/pools`, { method: "POST", body });
+      currentPoolId = pool.id;
+      toast("数据池已创建");
+    }
+    $("#pool-edit-card").style.display = "none"; editingPoolId = null;
+    refresh();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+async function delPool(id) {
+  if (!confirm("确认删除该数据池？（池内还有数据时会被拒绝）")) return;
+  try {
+    await api(`/api/testdata/pools/${id}`, { method: "DELETE" });
+    if (currentPoolId === id) currentPoolId = null;
+    toast("已删除"); refresh();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+/* ---------- 过期扫描 ---------- */
+$("#btn-scan").onclick = async () => {
+  const r = await api(`/api/projects/${projectId}/testdata/scan-overdue`, { method: "POST", body: {} });
+  toast(`扫描完成：提醒 ${r.reminded} 条，强制回收 ${r.reclaimed} 条`);
+  refresh();
+};
+
+/* ---------- 工具 ---------- */
+function fmtBorrowed(seconds) {
+  if (seconds == null) return "—";
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return s + " 秒";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + " 分钟";
+  const h = Math.floor(m / 60);
+  return h + " 小时 " + (m % 60) + " 分";
+}
+
+init();
+</script>
+</body>
+</html>

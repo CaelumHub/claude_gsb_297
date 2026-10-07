@@ -57,6 +57,10 @@ def _notify():
     return current_app.config["NOTIFY"]
 
 
+def _testdata():
+    return current_app.config["TESTDATA"]
+
+
 def _payload() -> dict:
     return request.get_json(silent=True) or {}
 
@@ -689,11 +693,198 @@ def list_events(project_id: str):
 
 
 # ---------------------------------------------------------------------------
+# 测试数据管理：数据池 / 借用 / 归还 / 回收
+# ---------------------------------------------------------------------------
+
+@api.get("/projects/<project_id>/testdata/pools")
+def list_data_pools(project_id: str):
+    return jsonify({"pools": _testdata().list_pools(project_id)})
+
+
+@api.post("/projects/<project_id>/testdata/pools")
+def create_data_pool(project_id: str):
+    data = _payload()
+    pool = _testdata().create_pool(project_id, data)
+    if "error" in pool:
+        return _err(pool["error"])
+    return jsonify(pool)
+
+
+@api.get("/testdata/pools/<pool_id>")
+def get_data_pool(pool_id: str):
+    pool = _testdata().get_pool(pool_id)
+    if pool is None:
+        return _err("数据池不存在", 404)
+    return jsonify(pool)
+
+
+@api.put("/testdata/pools/<pool_id>")
+def update_data_pool(pool_id: str):
+    if _testdata().get_pool(pool_id) is None:
+        return _err("数据池不存在", 404)
+    return jsonify(_testdata().update_pool(pool_id, _payload()))
+
+
+@api.delete("/testdata/pools/<pool_id>")
+def delete_data_pool(pool_id: str):
+    result = _testdata().delete_pool(pool_id)
+    if "error" in result:
+        return _err(result["error"])
+    return jsonify(result)
+
+
+@api.get("/projects/<project_id>/testdata/items")
+def list_data_items(project_id: str):
+    items = _testdata().list_items(
+        project_id,
+        pool_id=request.args.get("pool_id"),
+        env=request.args.get("env"),
+        status=request.args.get("status"),
+        tag=request.args.get("tag"),
+        q=request.args.get("q"),
+    )
+    return jsonify({"items": items, "count": len(items)})
+
+
+@api.post("/testdata/pools/<pool_id>/items")
+def create_data_item(pool_id: str):
+    item = _testdata().add_item(pool_id, _payload())
+    if "error" in item:
+        return _err(item["error"])
+    return jsonify(item)
+
+
+@api.post("/testdata/pools/<pool_id>/import")
+def import_data_items(pool_id: str):
+    """批量导入。body: {"items": [...], "env": "dev", "tags": [...]}，
+    或 {"lines": "key1=value1\\nkey2=value2"} 简式文本。"""
+    data = _payload()
+    entries = data.get("items")
+    if entries is None and data.get("lines"):
+        entries = []
+        for line in str(data["lines"]).splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, value = line.split("=", 1)
+                entries.append({"key": key.strip(), "value": value.strip()})
+            else:
+                entries.append({"key": line})
+    if not entries or not isinstance(entries, list):
+        return _err("没有可导入的数据（items 数组或 lines 文本至少提供一个）")
+    result = _testdata().import_items(pool_id, entries,
+                                      env=data.get("env"),
+                                      tags=data.get("tags"))
+    if "error" in result:
+        return _err(result["error"])
+    return jsonify(result)
+
+
+@api.get("/testdata/items/<item_id>")
+def get_data_item(item_id: str):
+    item = _testdata().get_item(item_id)
+    if item is None:
+        return _err("数据不存在", 404)
+    return jsonify(item)
+
+
+@api.put("/testdata/items/<item_id>")
+def update_data_item(item_id: str):
+    if _testdata().get_item(item_id) is None:
+        return _err("数据不存在", 404)
+    result = _testdata().update_item(item_id, _payload())
+    if result and "error" in result:
+        return _err(result["error"])
+    return jsonify(result)
+
+
+@api.delete("/testdata/items/<item_id>")
+def delete_data_item(item_id: str):
+    result = _testdata().delete_item(item_id)
+    if "error" in result:
+        return _err(result["error"])
+    return jsonify(result)
+
+
+@api.get("/testdata/items/<item_id>/history")
+def data_item_history(item_id: str):
+    if _testdata().get_item(item_id) is None:
+        return _err("数据不存在", 404)
+    return jsonify({"history": _testdata().item_history(item_id)})
+
+
+@api.post("/testdata/borrow")
+def borrow_data():
+    """申请借用：按 池+环境+标签 自动分配，或指定 item_id。"""
+    data = _payload()
+    loan = _testdata().borrow(
+        data.get("project_id", ""),
+        data.get("pool_id", ""),
+        data.get("borrower", ""),
+        env=data.get("env"),
+        tags=data.get("tags"),
+        item_id=data.get("item_id"),
+        lease_minutes=data.get("lease_minutes"),
+        purpose=data.get("purpose", ""),
+    )
+    if "error" in loan:
+        return _err(loan["error"], 409)
+    return jsonify(loan)
+
+
+@api.post("/testdata/return")
+def return_data():
+    data = _payload()
+    result = _testdata().return_item(item_id=data.get("item_id"),
+                                     loan_id=data.get("loan_id"),
+                                     borrower=data.get("borrower"))
+    if "error" in result:
+        return _err(result["error"], 409)
+    return jsonify(result)
+
+
+@api.post("/testdata/reclaim")
+def reclaim_data():
+    """强制回收借出中的数据（管理员操作）。"""
+    data = _payload()
+    result = _testdata().reclaim(item_id=data.get("item_id"),
+                                 loan_id=data.get("loan_id"),
+                                 operator=data.get("operator", "admin"))
+    if "error" in result:
+        return _err(result["error"], 409)
+    return jsonify(result)
+
+
+@api.get("/projects/<project_id>/testdata/loans")
+def list_data_loans(project_id: str):
+    loans = _testdata().list_loans(
+        project_id,
+        status=request.args.get("status"),
+        borrower=request.args.get("borrower"),
+        pool_id=request.args.get("pool_id"),
+        env=request.args.get("env"),
+    )
+    return jsonify({"loans": loans, "count": len(loans)})
+
+
+@api.get("/projects/<project_id>/testdata/stats")
+def testdata_stats(project_id: str):
+    return jsonify(_testdata().stats(project_id))
+
+
+@api.post("/projects/<project_id>/testdata/scan-overdue")
+def scan_overdue(project_id: str):
+    """手动触发一次过期扫描（后台调度周期也会自动执行）。"""
+    return jsonify(_testdata().check_overdue())
+
+
+# ---------------------------------------------------------------------------
 # 演示数据
 # ---------------------------------------------------------------------------
 
 @api.post("/seed/demo")
 def seed_demo():
-    """一键生成演示项目（含用例 / 套件 / 环境 / 计划 / 集成）。"""
+    """一键生成演示项目（含用例 / 套件 / 环境 / 计划 / 集成 / 测试数据池）。"""
     from .seed import seed_demo_data
-    return jsonify(seed_demo_data(_registry(), _env_mgr(), _notify()))
+    return jsonify(seed_demo_data(_registry(), _env_mgr(), _notify(), _testdata()))

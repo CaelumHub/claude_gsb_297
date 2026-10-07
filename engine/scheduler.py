@@ -34,7 +34,7 @@ class Scheduler:
     def __init__(self, registry, build_registry, executor, env_manager,
                  report_gen, coverage_analyzer, defect_manager, notify_manager,
                  max_build_workers: int = 4, max_case_workers: int = 8,
-                 tick_seconds: float = 20.0):
+                 tick_seconds: float = 20.0, testdata_manager=None):
         self.registry = registry
         self.builds = build_registry
         self.executor = executor
@@ -43,6 +43,7 @@ class Scheduler:
         self.coverage = coverage_analyzer
         self.defects = defect_manager
         self.notify = notify_manager
+        self.testdata = testdata_manager
 
         self.max_build_workers = max_build_workers
         self.max_case_workers = max_case_workers
@@ -280,6 +281,12 @@ class Scheduler:
                 self._scan_schedules()
             except Exception:  # noqa: BLE001
                 pass
+            # 顺带扫描测试数据过期借用：按池策略提醒或强制回收
+            if self.testdata is not None:
+                try:
+                    self.testdata.check_overdue()
+                except Exception:  # noqa: BLE001
+                    pass
             self._stop_event.wait(self.tick_seconds)
 
     def _scan_schedules(self) -> None:

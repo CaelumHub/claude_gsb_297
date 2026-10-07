@@ -24,6 +24,15 @@ INTEGRATION_TYPES = ["webhook", "slack", "email", "dingtalk"]
 # 触发来源
 TRIGGER_TYPES = ["manual", "schedule", "webhook", "ci"]
 
+# 测试数据状态：available 可借用 / in_use 借出锁定中 / disabled 停用维护
+DATA_ITEM_STATUSES = ["available", "in_use", "disabled"]
+
+# 借用记录状态：active 借出中 / returned 已归还 / force_reclaimed 被强制回收
+LOAN_STATUSES = ["active", "returned", "force_reclaimed"]
+
+# 数据池过期策略：notify 仅提醒 / reclaim 提醒并强制回收
+OVERDUE_ACTIONS = ["notify", "reclaim"]
+
 
 def new_id(prefix: str) -> str:
     """生成带前缀的唯一 id（时间戳 + 随机后缀，便于阅读与排查）。"""
