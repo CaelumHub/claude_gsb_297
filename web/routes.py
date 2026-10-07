@@ -17,6 +17,7 @@ from flask import Blueprint, current_app, jsonify, request
 
 from engine import new_id
 from engine.executor import TestExecutor
+from engine.testdata import TestDataError
 
 api = Blueprint("api", __name__, url_prefix="/api")
 
@@ -55,6 +56,10 @@ def _defects():
 
 def _notify():
     return current_app.config["NOTIFY"]
+
+
+def _tdm():
+    return current_app.config["TESTDATA"]
 
 
 def _payload() -> dict:
@@ -689,6 +694,241 @@ def list_events(project_id: str):
 
 
 # ---------------------------------------------------------------------------
+# 测试数据管理（数据池 / 借用归还 / 多环境隔离）
+# ---------------------------------------------------------------------------
+
+@api.get("/projects/<project_id>/tdm/stats")
+def tdm_stats(project_id: str):
+    return jsonify(_tdm().stats(project_id))
+
+
+@api.get("/projects/<project_id>/tdm/pools")
+def tdm_list_pools(project_id: str):
+    return jsonify({"pools": _tdm().list_pools(project_id)})
+
+
+@api.post("/projects/<project_id>/tdm/pools")
+def tdm_create_pool(project_id: str):
+    data = _payload()
+    if not (data.get("name") or "").strip():
+        return _err("数据池名称不能为空")
+    try:
+        return jsonify(_tdm().create_pool(project_id, data))
+    except TestDataError as exc:
+        return _err(str(exc))
+
+
+@api.get("/tdm/pools/<pool_id>")
+def tdm_get_pool(pool_id: str):
+    pool = _tdm().get_pool(pool_id)
+    if pool is None:
+        return _err("数据池不存在", 404)
+    return jsonify(pool)
+
+
+@api.put("/tdm/pools/<pool_id>")
+def tdm_update_pool(pool_id: str):
+    try:
+        return jsonify(_tdm().update_pool(pool_id, _payload()))
+    except TestDataError as exc:
+        return _err(str(exc))
+
+
+@api.delete("/tdm/pools/<pool_id>")
+def tdm_delete_pool(pool_id: str):
+    try:
+        _tdm().delete_pool(pool_id)
+    except TestDataError as exc:
+        return _err(str(exc))
+    return jsonify({"ok": True})
+
+
+@api.post("/tdm/pools/<pool_id>/import")
+def tdm_import(pool_id: str):
+    """批量导入数据：body 为 {"items": [...], "upsert": false}。"""
+    data = _payload()
+    try:
+        return jsonify(_tdm().import_items(
+            pool_id, data.get("items") or [],
+            upsert=bool(data.get("upsert", False))))
+    except TestDataError as exc:
+        return _err(str(exc))
+
+
+@api.post("/tdm/pools/<pool_id>/items")
+def tdm_add_item(pool_id: str):
+    try:
+        return jsonify(_tdm().add_item(pool_id, _payload()))
+    except TestDataError as exc:
+        return _err(str(exc))
+
+
+@api.get("/tdm/items")
+def tdm_list_items():
+    """按池 / 环境 / 状态 / 标签 / 关键字筛选数据项。"""
+    items = _tdm().list_items(
+        project_id=request.args.get("project_id"),
+        pool_id=request.args.get("pool_id"),
+        env=request.args.get("env"),
+        status=request.args.get("status"),
+        tag=request.args.get("tag"),
+        q=request.args.get("q"),
+    )
+    return jsonify({"items": items})
+
+
+@api.get("/tdm/items/<item_id>")
+def tdm_get_item(item_id: str):
+    item = _tdm().get_item(item_id)
+    if item is None:
+        return _err("数据不存在", 404)
+    return jsonify(item)
+
+
+@api.put("/tdm/items/<item_id>")
+def tdm_update_item(item_id: str):
+    try:
+        return jsonify(_tdm().update_item(item_id, _payload()))
+    except TestDataError as exc:
+        return _err(str(exc))
+
+
+@api.delete("/tdm/items/<item_id>")
+def tdm_delete_item(item_id: str):
+    try:
+        ok = _tdm().delete_item(item_id)
+    except TestDataError as exc:
+        return _err(str(exc))
+    if not ok:
+        return _err("数据不存在", 404)
+    return jsonify({"ok": True})
+
+
+@api.get("/tdm/items/<item_id>/history")
+def tdm_item_history(item_id: str):
+    try:
+        return jsonify(_tdm().item_history(item_id))
+    except TestDataError as exc:
+        return _err(str(exc), 404)
+
+
+@api.post("/tdm/items/<item_id>/borrow")
+def tdm_borrow_item(item_id: str):
+    """借用指定的一条数据。"""
+    data = _payload()
+    try:
+        return jsonify(_tdm().borrow_item(
+            item_id,
+            borrower=(data.get("borrower") or "").strip(),
+            ttl=data.get("ttl"),
+            purpose=data.get("purpose", ""),
+            source=data.get("source", "manual"),
+        ))
+    except TestDataError as exc:
+        return _err(str(exc), 409)
+
+
+@api.post("/tdm/pools/<pool_id>/borrow")
+def tdm_borrow_from_pool(pool_id: str):
+    """按条件批量申请借用：env 必填，可带 count / tags / ttl / partial。"""
+    data = _payload()
+    env = (data.get("env") or "").strip()
+    if not env:
+        return _err("借用必须指定环境（多环境隔离）")
+    pool = _tdm().get_pool(pool_id)
+    if pool is None:
+        return _err("数据池不存在", 404)
+    if env not in (pool.get("envs") or []):
+        return _err(f"环境 {env} 不在该数据池支持的环境 {pool.get('envs')} 内"
+                    "（多环境隔离，互不串用）")
+    try:
+        return jsonify(_tdm().borrow(
+            pool_id,
+            borrower=(data.get("borrower") or "").strip(),
+            env=env,
+            count=int(data.get("count", 1)),
+            ttl=data.get("ttl"),
+            purpose=data.get("purpose", ""),
+            tags=data.get("tags"),
+            source=data.get("source", "manual"),
+            partial=bool(data.get("partial", False)),
+        ))
+    except TestDataError as exc:
+        return _err(str(exc), 409)
+
+
+@api.get("/projects/<project_id>/tdm/leases")
+def tdm_list_leases(project_id: str):
+    leases = _tdm().list_leases(
+        project_id,
+        status=request.args.get("status"),
+        borrower=request.args.get("borrower"),
+        pool_id=request.args.get("pool_id"),
+        env=request.args.get("env"),
+        item_id=request.args.get("item_id"),
+    )
+    return jsonify({"leases": leases})
+
+
+@api.get("/tdm/leases/<lease_id>")
+def tdm_get_lease(lease_id: str):
+    lease = _tdm().get_lease(lease_id)
+    if lease is None:
+        return _err("借用单不存在", 404)
+    return jsonify(lease)
+
+
+@api.post("/tdm/leases/<lease_id>/return")
+def tdm_return_lease(lease_id: str):
+    data = _payload()
+    try:
+        return jsonify(_tdm().return_lease(
+            lease_id, borrower=data.get("borrower"), note=data.get("note", "")))
+    except TestDataError as exc:
+        return _err(str(exc), 409)
+
+
+@api.post("/tdm/leases/<lease_id>/force-return")
+def tdm_force_return(lease_id: str):
+    data = _payload()
+    try:
+        return jsonify(_tdm().force_return(
+            lease_id, operator=data.get("operator", "admin"),
+            reason=data.get("reason", "管理员强制回收")))
+    except TestDataError as exc:
+        return _err(str(exc), 409)
+
+
+@api.post("/tdm/leases/<lease_id>/renew")
+def tdm_renew_lease(lease_id: str):
+    data = _payload()
+    try:
+        return jsonify(_tdm().renew(
+            lease_id, extra_seconds=data.get("extra_seconds"),
+            actor=data.get("borrower")))
+    except TestDataError as exc:
+        return _err(str(exc), 409)
+
+
+@api.post("/projects/<project_id>/tdm/return-all")
+def tdm_return_all(project_id: str):
+    """按借用人批量归还（可限定 pool_id / env）。"""
+    data = _payload()
+    try:
+        return jsonify(_tdm().return_by_borrower(
+            project_id, (data.get("borrower") or "").strip(),
+            pool_id=data.get("pool_id"), env=data.get("env")))
+    except TestDataError as exc:
+        return _err(str(exc))
+
+
+@api.post("/tdm/sweep")
+def tdm_sweep():
+    """手动触发一次过期扫描（正常由调度器后台周期执行）。"""
+    return jsonify(_tdm().sweep_overdue())
+
+
+# ---------------------------------------------------------------------------
 # 演示数据
 # ---------------------------------------------------------------------------
 
@@ -696,4 +936,4 @@ def list_events(project_id: str):
 def seed_demo():
     """一键生成演示项目（含用例 / 套件 / 环境 / 计划 / 集成）。"""
     from .seed import seed_demo_data
-    return jsonify(seed_demo_data(_registry(), _env_mgr(), _notify()))
+    return jsonify(seed_demo_data(_registry(), _env_mgr(), _notify(), _tdm()))

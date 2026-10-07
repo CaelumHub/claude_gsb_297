@@ -13,7 +13,7 @@ import time
 from engine import new_id
 
 
-def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
+def seed_demo_data(registry, env_mgr, notify_mgr, tdm_mgr=None) -> dict:
     """生成演示项目，返回 ``{"project": ..., "env_id": ..., "suite_id": ...}``。"""
     proj = {
         "id": new_id("proj"),
@@ -139,5 +139,67 @@ def seed_demo_data(registry, env_mgr, notify_mgr) -> dict:
         "config": {"address": "qa@example.com"},
         "events": ["build.failed"],
     })
+
+    # -- 测试数据池：账号池（提醒）+ 订单号池（宽限期满强制回收） -----------
+    if tdm_mgr is not None:
+        account_pool = tdm_mgr.create_pool(pid, {
+            "name": "测试账号池",
+            "category": "账号",
+            "description": "登录账号，借走即锁定，用后归还。",
+            "envs": ["dev", "staging"],
+            "default_ttl": 4 * 3600,
+            "overdue_policy": "remind",
+            "tags": ["account", "auth"],
+        })
+        tdm_mgr.import_items(account_pool["id"], [
+            {"env": "dev", "data_key": f"user_{n:03d}@qa.local",
+             "payload": {"username": f"user_{n:03d}", "password": "Pa$$w0rd",
+                         "level": "vip" if n % 3 == 0 else "normal"},
+             "tags": ["vip"] if n % 3 == 0 else ["normal"]}
+            for n in range(1, 7)
+        ] + [
+            {"env": "staging", "data_key": "user_001@qa.local",
+             "payload": {"username": "user_001", "password": "Staging#1",
+                         "level": "admin"},
+             "tags": ["admin"]},
+            {"env": "staging", "data_key": "user_002@qa.local",
+             "payload": {"username": "user_002", "password": "Staging#2",
+                         "level": "normal"},
+             "tags": ["normal"]},
+        ])
+
+        order_pool = tdm_mgr.create_pool(pid, {
+            "name": "订单号池",
+            "category": "订单",
+            "description": "可复用的测试订单号，替代写死在用例里的常量。",
+            "envs": ["dev", "staging"],
+            "default_ttl": 3600,
+            "overdue_policy": "reclaim",
+            "grace_seconds": 1800,
+            "tags": ["order"],
+        })
+        tdm_mgr.import_items(order_pool["id"], [
+            {"env": "dev", "data_key": f"ORD-2026{n:06d}",
+             "payload": {"sku": f"SKU-{1000 + n}", "amount": n * 37},
+             "tags": ["paid" if n % 2 else "unpaid"]}
+            for n in range(1, 9)
+        ])
+
+        # 借一条 dev 账号给「张三」（正常在用）
+        dev_items = tdm_mgr.list_items(pool_id=account_pool["id"], env="dev")
+        tdm_mgr.borrow_item(dev_items[0]["id"], "张三",
+                            ttl=4 * 3600, purpose="登录链路回归",
+                            source="case:case_login_smoke")
+        # 借一条 staging 账号给「李四」并手动置为过期，用于演示过期提醒
+        st_items = tdm_mgr.list_items(pool_id=account_pool["id"], env="staging")
+        overdue_lease = tdm_mgr.borrow_item(
+            st_items[0]["id"], "李四", ttl=3600, purpose="权限校验专项")
+        past = time.time() - 5400  # 1.5 小时前借出、应还时间已过
+        registry.store("tdm_leases").update(overdue_lease["id"], {
+            "borrowed_at": past, "due_at": past + 3600,
+        })
+        # 借一个订单号给「自动化任务·nightly」（订单池，用于演示强制回收）
+        tdm_mgr.borrow(order_pool["id"], "nightly-bot", "dev", count=1,
+                       purpose="夜间下单链路", source="ci")
 
     return {"project": proj, "env_id": env["id"], "suite_id": suite["id"]}

@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>借用记录 - 自动化测试与持续集成平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .lease-detail { border: 1px solid var(--border); border-radius: 9px; padding: 14px 16px; margin-top: 12px; }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">测试数据管理 · 借用记录</h1>
+    <p class="page-desc">跟踪每条数据当前被谁借、借了多久、历史借用记录；过期自动提醒或强制回收，支持一键批量归还。</p>
+
+    <div class="card">
+      <div class="row">
+        <label style="margin:0 6px 0 0;align-self:center">项目</label>
+        <select id="project-select" style="max-width:260px" onchange="switchProject(this.value)"></select>
+        <span style="flex:1"></span>
+        <button class="btn secondary" id="btn-sweep">立即扫描过期</button>
+      </div>
+      <div class="row mt" style="gap:10px;flex-wrap:wrap">
+        <select id="f-status" onchange="loadLeases()">
+          <option value="">全部状态</option>
+          <option value="active" selected>借用中</option>
+          <option value="overdue">已过期</option>
+          <option value="returned">已归还</option>
+          <option value="reclaimed">已回收</option>
+        </select>
+        <select id="f-env" onchange="loadLeases()">
+          <option value="">全部环境</option>
+          <option value="dev">开发 dev</option>
+          <option value="staging">预发 staging</option>
+          <option value="prod">生产 prod</option>
+        </select>
+        <select id="f-pool" onchange="loadLeases()"><option value="">全部数据池</option></select>
+        <input type="text" id="f-borrower" placeholder="借用人" style="max-width:140px" onchange="loadLeases()">
+        <button class="btn small secondary" onclick="loadLeases()">筛选</button>
+        <span style="flex:1"></span>
+        <input type="text" id="rb-borrower" placeholder="按借用人批量归还" style="max-width:170px">
+        <button class="btn small green" id="btn-return-all">一键归还</button>
+      </div>
+    </div>
+
+    <section class="card">
+      <div id="summary" class="row" style="gap:14px"></div>
+      <div id="lease-host" class="mt"><div class="empty">加载中…</div></div>
+    </section>
+
+    <section class="card" id="detail-card" style="display:none">
+      <h2>借用单详情</h2>
+      <div id="detail-body"></div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+renderNav("leases");
+
+let projectId = null;
+let leases = [];
+let pools = [];
+
+async function init() {
+  const params = new URLSearchParams(location.search);
+  projectId = await fillProjectSelect($("#project-select"), params.get("project_id"));
+  if (projectId) {
+    const d = await api(`/api/projects/${projectId}/tdm/pools`);
+    pools = d.pools || [];
+    $("#f-pool").innerHTML = '<option value="">全部数据池</option>' +
+      pools.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+    await loadLeases();
+  }
+}
+
+async function switchProject(id) {
+  location.search = `?project_id=${encodeURIComponent(id)}`;
+}
+
+function fmtLeaseDur(l) {
+  if (l.status === "returned" || l.status === "reclaimed") {
+    return `${fmtDur(l.held_seconds)}（已结束）`;
+  }
+  let s = `${fmtDur(l.held_seconds)}（进行中）`;
+  if (l.overdue_seconds > 0) s += ` · <span style="color:var(--amber)">已逾期 ${fmtDur(l.overdue_seconds)}</span>`;
+  return s;
+}
+
+async function loadLeases() {
+  if (!projectId) return;
+  const p = new URLSearchParams();
+  if ($("#f-status").value) p.set("status", $("#f-status").value);
+  if ($("#f-env").value) p.set("env", $("#f-env").value);
+  if ($("#f-pool").value) p.set("pool_id", $("#f-pool").value);
+  if ($("#f-borrower").value.trim()) p.set("borrower", $("#f-borrower").value.trim());
+  const d = await api(`/api/projects/${projectId}/tdm/leases?${p}`);
+  leases = d.leases || [];
+
+  const open = leases.filter(l => l.status === "active" || l.status === "overdue");
+  $("#summary").innerHTML = `
+    <span class="muted">共 <strong>${leases.length}</strong> 张借用单</span>
+    <span class="badge active">进行中 ${open.filter(l => l.status === "active").length}</span>
+    <span class="badge overdue">过期 ${open.filter(l => l.status === "overdue").length}</span>`;
+
+  const host = $("#lease-host");
+  if (!leases.length) { host.innerHTML = '<div class="empty">没有匹配的借用记录。</div>'; return; }
+  host.innerHTML = `
+    <table><thead><tr>
+      <th>数据</th><th>环境</th><th>数据池</th><th>借用人</th><th>用途 / 来源</th>
+      <th>状态</th><th>借出时间</th><th>应还时间</th><th>借了多久</th><th>操作</th>
+    </tr></thead><tbody>
+    ${leases.map(l => `
+      <tr>
+        <td><a href="#" onclick="showDetail('${l.id}');return false"><strong>${esc(l.data_key)}</strong></a></td>
+        <td><span class="badge env">${esc(l.env)}</span></td>
+        <td class="muted">${esc(l.pool_name || "—")}</td>
+        <td>${esc(l.borrower)}<div class="muted mono" style="font-size:11px">${esc(l.source || "")}</div></td>
+        <td style="max-width:160px">${esc(l.purpose || "—")}</td>
+        <td>${l.status === "overdue"
+            ? `<span class="badge overdue">已过期</span><div class="muted" style="font-size:11px">提醒 ${l.remind_count||0} 次</div>`
+            : `<span class="badge ${l.status}">${STATUS_LABELS[l.status] || l.status}</span>`}</td>
+        <td>${fmtTime(l.borrowed_at)}</td>
+        <td>${fmtTime(l.due_at)}</td>
+        <td style="font-size:12.5px">${fmtLeaseDur(l)}</td>
+        <td class="row">
+          <button class="btn small secondary" onclick="showDetail('${l.id}')">详情</button>
+          ${(l.status === "active" || l.status === "overdue") ? `
+            <button class="btn small" onclick="renewLease('${l.id}')">续借</button>
+            <button class="btn small green" onclick="returnLease('${l.id}')">归还</button>
+            <button class="btn small danger" onclick="forceReturn('${l.id}')">强制回收</button>` : ""}
+        </td>
+      </tr>`).join("")}
+    </tbody></table>`;
+}
+
+async function showDetail(leaseId) {
+  const l = await api(`/api/tdm/leases/${leaseId}`);
+  $("#detail-card").style.display = "";
+  const payloadStr = l.payload ? JSON.stringify(l.payload, null, 1) : "—";
+  $("#detail-body").innerHTML = `
+    <div class="grid cols-3">
+      <div><label>借用单</label><div class="mono" style="font-size:12px">${esc(l.id)}</div></div>
+      <div><label>数据 Key</label><strong>${esc(l.data_key)}</strong></div>
+      <div><label>环境</label><span class="badge env">${esc(l.env)}</span></div>
+      <div><label>借用人</label>${esc(l.borrower)}</div>
+      <div><label>来源</label><span class="mono" style="font-size:12px">${esc(l.source || "manual")}</span></div>
+      <div><label>状态</label><span class="badge ${l.status}">${STATUS_LABELS[l.status] || l.status}</span></div>
+      <div><label>借出</label>${fmtTime(l.borrowed_at)}</div>
+      <div><label>应还</label>${fmtTime(l.due_at)}</div>
+      <div><label>${l.returned_at ? "实际归还" : "已持有时长"}</label>
+        ${l.returned_at ? fmtTime(l.returned_at) : fmtDur(l.held_seconds)}</div>
+    </div>
+    <div class="mt"><label>数据内容</label><pre class="mono" style="font-size:12px;background:var(--surface-2);padding:10px;border-radius:8px;white-space:pre-wrap">${esc(payloadStr)}</pre></div>
+    <div class="mt"><label>用途</label>${esc(l.purpose || "—")}</div>
+    <div class="mt lease-detail">
+      <label>事件流（借出 / 提醒 / 归还 / 回收全程留痕）</label>
+      ${(l.events || []).map(ev => `
+        <div class="event-line"><span class="muted mono">${fmtTime(ev.at)}</span>
+          <span class="tag">${esc(ev.type)}</span> ${esc(ev.message || "")}
+          ${ev.actor ? `<span class="muted">· ${esc(ev.actor)}</span>` : ""}</div>`).join("")}
+    </div>`;
+  $("#detail-card").scrollIntoView({ behavior: "smooth" });
+}
+
+async function returnLease(id) {
+  if (!confirm("确认归还？数据将立即恢复为可借。")) return;
+  try {
+    await api(`/api/tdm/leases/${id}/return`, { method: "POST", body: {} });
+    toast("归还成功"); loadLeases();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function renewLease(id) {
+  const extra = parseInt(prompt("续借时长（秒，留空用池默认值）：") || "0", 10) || null;
+  try {
+    await api(`/api/tdm/leases/${id}/renew`, { method: "POST", body: { extra_seconds: extra } });
+    toast("续借成功"); loadLeases();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function forceReturn(id) {
+  if (!confirm("确认强制回收？将立即解除数据锁定。")) return;
+  try {
+    await api(`/api/tdm/leases/${id}/force-return`,
+      { method: "POST", body: { operator: "admin", reason: "借用记录页手动回收" } });
+    toast("已强制回收"); loadLeases();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+$("#btn-return-all").onclick = async () => {
+  const borrower = ($("#rb-borrower").value || "").trim();
+  if (!borrower) return toast("请填写借用人", "error");
+  if (!confirm(`确认归还「${borrower}」当前环境筛选下的全部未还数据？`)) return;
+  const body = { borrower };
+  if ($("#f-env").value) body.env = $("#f-env").value;
+  if ($("#f-pool").value) body.pool_id = $("#f-pool").value;
+  try {
+    const r = await api(`/api/projects/${projectId}/tdm/return-all`,
+      { method: "POST", body });
+    toast(`已归还 ${r.returned} 张借用单`);
+    loadLeases();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+$("#btn-sweep").onclick = async () => {
+  const r = await api("/api/tdm/sweep", { method: "POST" });
+  toast(`扫描完成：新过期 ${r.marked_overdue} / 提醒 ${r.reminded} / 回收 ${r.reclaimed}`);
+  loadLeases();
+};
+
+init();
+</script>
+</body>
+</html>

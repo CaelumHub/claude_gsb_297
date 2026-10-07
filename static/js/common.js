@@ -13,19 +13,26 @@ const PAGES = [
   { file: "environments.html",name: "环境管理",     desc: "配置与依赖" },
   { file: "schedules.html",   name: "定时任务",     desc: "计划与触发" },
   { file: "notifications.html", name: "通知与集成", desc: "Webhook 等" },
+  { file: "testdata.html",    name: "测试数据池",   desc: "数据借用与回收" },
+  { file: "leases.html",      name: "借用记录",     desc: "锁定与过期跟踪" },
 ];
 
 const PAGE_NAMES = {
   projects: "项目管理", cases: "测试用例", suites: "测试套件与分组",
   monitor: "执行监控", reports: "测试报告", coverage: "代码覆盖率",
   defects: "缺陷跟踪", environments: "环境管理", schedules: "定时任务与触发",
-  notifications: "通知与集成",
+  notifications: "通知与集成", testdata: "测试数据管理 · 数据池",
+  leases: "测试数据管理 · 借用记录",
 };
 
 const STATUS_LABELS = {
   pending: "等待中", running: "运行中", passed: "通过", failed: "失败",
   cancelled: "已取消", error: "错误", skipped: "跳过", timeout: "超时",
+  available: "可借", borrowed: "借出中", reserved: "预留", retired: "已退役",
+  active: "借用中", returned: "已归还", overdue: "已过期", reclaimed: "已回收",
 };
+
+const TDM_ENV_LABELS = { dev: "开发 dev", staging: "预发 staging", prod: "生产 prod" };
 
 const PRIORITY_LABELS = { P0: "P0 · 最高", P1: "P1 · 高", P2: "P2 · 中", P3: "P3 · 低" };
 

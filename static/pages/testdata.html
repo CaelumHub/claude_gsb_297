@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>测试数据池 - 自动化测试与持续集成平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <style>
+    .env-stat { font-size: 12.5px; margin: 2px 0; }
+    .item-payload { font-family: var(--mono); font-size: 12px; color: var(--text-muted); }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar" id="site-sidebar"></aside>
+
+  <main class="main">
+    <h1 class="page-title">测试数据管理 · 数据池</h1>
+    <p class="page-desc">把账号、订单号等测试数据按类别收进数据池，按环境隔离；支持批量导入、申请借用、用后归还，借出期间对其他人锁定。</p>
+
+    <div class="card">
+      <div class="row">
+        <label style="margin:0 6px 0 0;align-self:center">项目</label>
+        <select id="project-select" style="max-width:260px" onchange="switchProject(this.value)"></select>
+        <span style="flex:1"></span>
+        <button class="btn" id="btn-new-pool">新建数据池</button>
+        <button class="btn secondary" id="btn-sweep">立即扫描过期</button>
+      </div>
+      <div id="stats" class="row mt" style="gap:18px;flex-wrap:wrap"></div>
+    </div>
+
+    <div class="grid cols-2">
+      <section class="card">
+        <h2>数据池</h2>
+        <div id="pool-list"><div class="empty">加载中…</div></div>
+      </section>
+
+      <section class="card" id="pool-edit-card" style="display:none">
+        <h2 id="pool-edit-title">新建数据池</h2>
+        <div class="grid cols-2">
+          <div><label>名称 *</label><input type="text" id="p-name" placeholder="测试账号池"></div>
+          <div><label>类别</label><input type="text" id="p-category" placeholder="账号 / 订单 / 手机号"></div>
+        </div>
+        <div class="mt"><label>描述</label><input type="text" id="p-desc"></div>
+        <div class="grid cols-2 mt">
+          <div><label>支持环境（多选，环境隔离）</label>
+            <div id="p-envs" class="row" style="gap:14px"></div>
+          </div>
+          <div><label>默认借用时长（秒）</label>
+            <input type="number" id="p-ttl" value="3600"></div>
+        </div>
+        <div class="grid cols-2 mt">
+          <div><label>过期策略</label>
+            <select id="p-policy">
+              <option value="remind">remind · 仅自动提醒</option>
+              <option value="reclaim">reclaim · 宽限期后强制回收</option>
+            </select></div>
+          <div><label>强制回收宽限（秒）</label>
+            <input type="number" id="p-grace" value="1800"></div>
+        </div>
+        <div class="row mt">
+          <button class="btn" id="btn-save-pool">保存</button>
+          <button class="btn secondary" id="btn-cancel-pool">取消</button>
+        </div>
+      </section>
+    </div>
+
+    <section class="card" id="items-card" style="display:none">
+      <div class="row spread">
+        <h2 id="items-title" style="margin:0">池内数据</h2>
+        <div class="row">
+          <select id="f-env" onchange="loadItems()"></select>
+          <select id="f-status" onchange="loadItems()">
+            <option value="">全部状态</option>
+            <option value="available">可借</option>
+            <option value="borrowed">借出中</option>
+            <option value="retired">已退役</option>
+          </select>
+          <input type="text" id="f-tag" placeholder="标签" style="max-width:110px" onchange="loadItems()">
+          <input type="text" id="f-q" placeholder="搜索 key / 内容" style="max-width:180px" oninput="debounceLoad()">
+          <button class="btn secondary small" onclick="loadItems()">筛选</button>
+          <button class="btn small" id="btn-import">批量导入</button>
+          <button class="btn small green" id="btn-borrow-batch">申请借用</button>
+        </div>
+      </div>
+      <div id="items-host" class="mt"><div class="empty">请先在左侧选择一个数据池。</div></div>
+    </section>
+
+    <!-- 批量导入弹层 -->
+    <div class="card" id="import-card" style="display:none">
+      <h2>批量导入 · <span id="import-pool-name"></span></h2>
+      <p class="muted" style="font-size:13px">
+        JSON 数组，每条形如 <code>{"env":"dev","data_key":"user01@qa.local",
+        "payload":{"username":"user01"},"tags":["vip"]}</code>；同环境同 key 视为重复。
+      </p>
+      <div class="row">
+        <label style="margin:0 8px 0 0"><input type="checkbox" id="imp-upsert"> 重复且未借出时更新</label>
+      </div>
+      <textarea id="imp-text" class="mono" style="min-height:170px;width:100%;margin-top:8px"
+>[
+  {"env": "dev", "data_key": "user100@qa.local", "payload": {"username": "user100", "password": "x"}, "tags": ["normal"]}
+]</textarea>
+      <div class="row mt">
+        <button class="btn" id="btn-do-import">导入</button>
+        <button class="btn secondary" onclick="document.getElementById('import-card').style.display='none'">取消</button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="/static/js/common.js"></script>
+<script>
+renderNav("testdata");
+
+let projectId = null;
+let pools = [];
+let poolId = null;
+let items = [];
+let searchTimer = null;
+
+async function init() {
+  const params = new URLSearchParams(location.search);
+  projectId = await fillProjectSelect($("#project-select"), params.get("project_id"));
+  if (projectId) {
+    renderEnvChecks();
+    await loadPools();
+  }
+}
+
+function renderEnvChecks(checked = ["dev", "staging"]) {
+  $("#p-envs").innerHTML = ["dev", "staging", "prod"].map(e => `
+    <label style="margin:0;font-weight:400"><input type="checkbox" value="${e}"
+      ${checked.includes(e) ? "checked" : ""}> ${TDM_ENV_LABELS[e]}</label>`).join("");
+}
+function checkedEnvs() {
+  return $$("#p-envs input:checked").map(c => c.value);
+}
+
+async function switchProject(id) {
+  projectId = id; poolId = null;
+  $("#items-card").style.display = "none";
+  await loadPools();
+}
+
+async function loadStats() {
+  const s = await api(`/api/projects/${projectId}/tdm/stats`);
+  const envBits = Object.entries(s.items_by_env || {}).map(([env, v]) =>
+    `<span class="badge env">${esc(TDM_ENV_LABELS[env] || env)}</span>
+     <span class="muted">共 ${v.total} / 可借 ${v.available||0} / 借出 ${v.borrowed||0}</span>`)
+    .join("　");
+  $("#stats").innerHTML = `
+    <span><strong>${s.pools}</strong> <span class="muted">个数据池</span></span>
+    <span><strong>${s.items_total}</strong> <span class="muted">条数据</span></span>
+    <span class="badge active">借用中 ${s.active_count}</span>
+    <span class="badge overdue">过期 ${s.overdue_count}</span>
+    <span style="flex:1"></span>${envBits}`;
+}
+
+async function loadPools() {
+  if (!projectId) return;
+  const d = await api(`/api/projects/${projectId}/tdm/pools`);
+  pools = d.pools || [];
+  loadStats();
+  const host = $("#pool-list");
+  if (!pools.length) {
+    host.innerHTML = '<div class="empty">还没有数据池，点击「新建数据池」。</div>';
+    $("#items-card").style.display = "none";
+    return;
+  }
+  host.innerHTML = pools.map(p => `
+    <div class="pool-item ${p.id === poolId ? "active-pool" : ""}">
+      <div class="row spread">
+        <div><strong>${esc(p.name)}</strong>
+          <span class="tag">${esc(p.category || "")}</span>
+          <span class="badge ${p.overdue_policy === "reclaim" ? "violet" : "blue"}">
+            ${p.overdue_policy === "reclaim" ? "过期强制回收" : "过期提醒"}</span>
+        </div>
+        <div class="row">
+          <button class="btn small" onclick="selectPool('${p.id}')">查看数据</button>
+          <button class="btn small secondary" onclick="editPool('${p.id}')">编辑</button>
+          <button class="btn small danger" onclick="delPool('${p.id}')">删除</button>
+        </div>
+      </div>
+      <div class="muted" style="font-size:13px;margin-top:4px">${esc(p.description || "")}</div>
+      <div class="muted env-stat">
+        ${Object.entries(p.by_env || {}).map(([e, v]) =>
+          `${esc(TDM_ENV_LABELS[e] || e)}：可借 ${v.available}/${v.total}`).join("　·　")}
+      </div>
+    </div>`).join("");
+}
+
+async function selectPool(id) {
+  poolId = id;
+  const pool = pools.find(p => p.id === id);
+  $("#items-card").style.display = "";
+  $("#import-card").style.display = "none";
+  $("#items-title").textContent = `池内数据 · ${pool ? pool.name : ""}`;
+  const envs = pool ? pool.envs : ["dev", "staging", "prod"];
+  $("#f-env").innerHTML = envs.map(e =>
+    `<option value="${e}">${esc(TDM_ENV_LABELS[e] || e)}</option>`).join("");
+  await loadPools();
+  loadItems();
+}
+
+function newPool() {
+  $("#pool-edit-card").style.display = "";
+  $("#pool-edit-title").textContent = "新建数据池";
+  $("#p-name").value = ""; $("#p-category").value = ""; $("#p-desc").value = "";
+  $("#p-ttl").value = "3600"; $("#p-grace").value = "1800"; $("#p-policy").value = "remind";
+  renderEnvChecks(["dev", "staging"]);
+  $("#p-name").dataset.id = "";
+}
+
+function editPool(id) {
+  const p = pools.find(x => x.id === id);
+  if (!p) return;
+  $("#pool-edit-card").style.display = "";
+  $("#pool-edit-title").textContent = "编辑数据池";
+  $("#p-name").value = p.name; $("#p-name").dataset.id = id;
+  $("#p-category").value = p.category || ""; $("#p-desc").value = p.description || "";
+  $("#p-ttl").value = p.default_ttl; $("#p-grace").value = p.grace_seconds;
+  $("#p-policy").value = p.overdue_policy;
+  renderEnvChecks(p.envs || ["dev", "staging"]);
+}
+
+async function delPool(id) {
+  if (!confirm("删除数据池会一并删除池内数据与借用历史，确认？")) return;
+  try {
+    await api(`/api/tdm/pools/${id}`, { method: "DELETE" });
+    if (poolId === id) { poolId = null; $("#items-card").style.display = "none"; }
+    toast("已删除"); loadPools();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+$("#btn-new-pool").onclick = newPool;
+$("#btn-cancel-pool").onclick = () => $("#pool-edit-card").style.display = "none";
+
+$("#btn-save-pool").onclick = async () => {
+  const name = $("#p-name").value.trim();
+  if (!name) return toast("请输入数据池名称", "error");
+  const envs = checkedEnvs();
+  if (!envs.length) return toast("至少选择一个环境", "error");
+  const body = {
+    name, category: $("#p-category").value.trim(), description: $("#p-desc").value,
+    envs, default_ttl: parseInt($("#p-ttl").value || "3600", 10),
+    overdue_policy: $("#p-policy").value, grace_seconds: parseInt($("#p-grace").value || "1800", 10),
+  };
+  const id = $("#p-name").dataset.id;
+  try {
+    if (id) { await api(`/api/tdm/pools/${id}`, { method: "PUT", body }); toast("已保存"); }
+    else { const p = await api(`/api/projects/${projectId}/tdm/pools`, { method: "POST", body }); poolId = p.id; toast("已创建"); }
+    $("#pool-edit-card").style.display = "none";
+    await loadPools();
+    if (id || poolId) selectPool(poolId);
+  } catch (e) { toast(e.message, "error"); }
+};
+
+function debounceLoad() { clearTimeout(searchTimer); searchTimer = setTimeout(loadItems, 300); }
+
+async function loadItems() {
+  if (!poolId) return;
+  const p = new URLSearchParams({ pool_id: poolId, env: $("#f-env").value });
+  if ($("#f-status").value) p.set("status", $("#f-status").value);
+  if ($("#f-tag").value.trim()) p.set("tag", $("#f-tag").value.trim());
+  if ($("#f-q").value.trim()) p.set("q", $("#f-q").value.trim());
+  const d = await api(`/api/tdm/items?${p}`);
+  items = d.items || [];
+  const host = $("#items-host");
+  if (!items.length) { host.innerHTML = '<div class="empty">该环境下没有匹配数据，试试批量导入。</div>'; return; }
+  host.innerHTML = `
+    <table><thead><tr>
+      <th>数据 Key</th><th>环境</th><th>内容</th><th>标签</th><th>状态 / 当前借用</th><th>操作</th>
+    </tr></thead><tbody>
+    ${items.map(i => {
+      const l = i.current_lease;
+      const st = i.status === "borrowed"
+        ? `<span class="badge borrowed">借出中</span><div class="muted" style="font-size:12px;margin-top:3px">
+             ${l ? esc(l.borrower) + " · " + esc(l.purpose || "—") : ""}</div>`
+        : `<span class="badge ${i.status}">${STATUS_LABELS[i.status] || i.status}</span>`;
+      return `<tr>
+        <td><strong>${esc(i.data_key)}</strong></td>
+        <td><span class="badge env">${esc(i.env)}</span></td>
+        <td class="item-payload">${esc(JSON.stringify(i.payload || {}))}</td>
+        <td>${tagsHtml(i.tags)}</td>
+        <td>${st}</td>
+        <td class="row">
+          ${i.status === "available"
+            ? `<button class="btn small" onclick="borrowOne('${i.id}')">借用</button>`
+            : `<button class="btn small secondary" onclick="showHistory('${i.id}')">跟踪</button>
+               <button class="btn small danger" onclick="forceReturn('${(l||{}).id}')">强制回收</button>`}
+          <button class="btn small secondary" onclick="showHistory('${i.id}')">历史</button>
+        </td></tr>`;
+    }).join("")}
+    </tbody></table>`;
+}
+
+async function borrowOne(itemId) {
+  const borrower = (prompt("借用人（如 张三 / nightly-bot）：") || "").trim();
+  if (!borrower) return;
+  const ttl = parseInt(prompt("借用时长（秒，留空用池默认 3600）：") || "0", 10) || null;
+  const purpose = prompt("用途（可留空）：") || "";
+  try {
+    await api(`/api/tdm/items/${itemId}/borrow`, { method: "POST", body: { borrower, ttl, purpose } });
+    toast("借用成功，数据已对其他人锁定");
+    loadItems(); loadPools();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function forceReturn(leaseId) {
+  if (!leaseId) return;
+  if (!confirm("确认强制回收该数据？借用单将标记为「已回收」。")) return;
+  try {
+    await api(`/api/tdm/leases/${leaseId}/force-return`,
+      { method: "POST", body: { operator: "admin", reason: "页面手动强制回收" } });
+    toast("已回收，数据恢复可借"); loadItems(); loadPools();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+async function showHistory(itemId) {
+  const d = await api(`/api/tdm/items/${itemId}/history`);
+  const i = d.item || {};
+  const rows = (d.leases || []).map(l => `
+    <tr><td class="mono">${esc(l.id)}</td><td>${esc(l.borrower)}</td>
+      <td>${esc(l.purpose || "—")}</td><td><span class="badge ${l.status}">${STATUS_LABELS[l.status] || l.status}</span></td>
+      <td>${fmtTime(l.borrowed_at)}</td><td>${fmtTime(l.due_at)}</td>
+      <td>${fmtDur(l.held_seconds)}</td></tr>`).join("");
+  const events = (d.leases || []).flatMap(l => (l.events || []).map(ev =>
+    `<div class="event-line"><span class="muted mono">${fmtTime(ev.at)}</span>
+      <span class="tag">${esc(ev.type)}</span> ${esc(ev.message || "")}
+      <span class="muted">（${esc(l.borrower)} / ${esc(l.data_key)}）</span></div>`)).join("");
+  alert(`「${i.data_key}」共 ${d.leases.length} 次借用，详细跟踪请见「借用记录」页。`);
+  const win = window.open("", "_blank");
+  if (win) win.document.write(`<html><head><title>${esc(i.data_key)} 借用历史</title>
+    <link rel="stylesheet" href="/static/css/style.css"></head>
+    <body style="padding:24px"><h2>${esc(i.data_key)} · ${esc(i.env)} 借用历史</h2>
+    <table><thead><tr><th>借用单</th><th>借用人</th><th>用途</th><th>状态</th>
+    <th>借出</th><th>应还</th><th>实际持有时长</th></tr></thead><tbody>${rows}</tbody></table>
+    <h3 style="margin-top:20px">事件流</h3>${events || '<p class="muted">无</p>'}
+    <p class="mt"><a href="/page/leases.html?project_id=${esc(projectId)}">前往借用记录页 →</a></p>
+    </body></html>`);
+}
+
+$("#btn-import").onclick = () => {
+  const pool = pools.find(p => p.id === poolId);
+  $("#import-pool-name").textContent = pool ? pool.name : "";
+  $("#import-card").style.display = "";
+  $("#import-card").scrollIntoView({ behavior: "smooth" });
+};
+
+$("#btn-do-import").onclick = async () => {
+  let items_raw;
+  try { items_raw = JSON.parse($("#imp-text").value || "[]"); }
+  catch (_) { return toast("JSON 格式不合法", "error"); }
+  try {
+    const r = await api(`/api/tdm/pools/${poolId}/import`, {
+      method: "POST",
+      body: { items: items_raw, upsert: $("#imp-upsert").checked },
+    });
+    toast(`导入完成：新增 ${r.created} / 更新 ${r.updated} / 跳过重复 ${r.skipped}`);
+    $("#import-card").style.display = "none";
+    loadItems(); loadPools();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+$("#btn-borrow-batch").onclick = async () => {
+  const env = $("#f-env").value;
+  const borrower = (prompt(`在【${TDM_ENV_LABELS[env] || env}】申请借用，借用人：`) || "").trim();
+  if (!borrower) return;
+  const count = parseInt(prompt("借用数量：", "1") || "0", 10);
+  if (!count) return;
+  const tagStr = (prompt("要求标签（逗号分隔，全部命中；留空不限）：") || "").trim();
+  const tags = tagStr ? tagStr.split(/[,，]/).map(t => t.trim()).filter(Boolean) : null;
+  try {
+    const r = await api(`/api/tdm/pools/${poolId}/borrow`, {
+      method: "POST",
+      body: { borrower, env, count, tags, partial: false },
+    });
+    toast(`已借用 ${r.borrowed} 条（${env}）`);
+    loadItems(); loadPools();
+  } catch (e) { toast(e.message, "error"); }
+};
+
+$("#btn-sweep").onclick = async () => {
+  if (!projectId) return;
+  const r = await api("/api/tdm/sweep", { method: "POST" });
+  toast(`扫描完成：新过期 ${r.marked_overdue} / 提醒 ${r.reminded} / 回收 ${r.reclaimed}`);
+  loadPools(); loadItems();
+};
+
+init();
+</script>
+</body>
+</html>

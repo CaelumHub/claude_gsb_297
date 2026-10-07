@@ -24,6 +24,18 @@ INTEGRATION_TYPES = ["webhook", "slack", "email", "dingtalk"]
 # 触发来源
 TRIGGER_TYPES = ["manual", "schedule", "webhook", "ci"]
 
+# -- 测试数据管理（TDM） ----------------------------------------------------
+
+# 数据池支持的逻辑环境（多环境隔离的环境轴；与具体项目的环境实例解耦）
+TDM_ENVIRONMENTS = ["dev", "staging", "prod"]
+
+# 数据项 / 借用单状态
+TDM_DATA_STATUSES = ["available", "borrowed", "reserved", "retired"]
+TDM_LEASE_STATUSES = ["active", "returned", "overdue", "reclaimed"]
+
+# 过期策略：仅提醒 / 提醒后强制回收
+TDM_OVERDUE_POLICIES = ["remind", "reclaim"]
+
 
 def new_id(prefix: str) -> str:
     """生成带前缀的唯一 id（时间戳 + 随机后缀，便于阅读与排查）。"""
